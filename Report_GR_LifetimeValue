@@ -1,0 +1,131 @@
+DECLARE dateToday TIMESTAMP DEFAULT "2022-10-01" ;  
+DECLARE dateYearOne DATE DEFAULT "2022-10-01" ;  
+DECLARE dateYearTwo DATE DEFAULT "2021-10-01" ;  
+DECLARE dateYearThree DATE DEFAULT "2020-10-01" ;  
+
+WITH Orders_tmp AS (
+  SELECT
+    DISTINCT OrderId,
+    ocdMasterID,
+    OrderDate,
+    CHF
+  FROM (
+    SELECT
+      a.context.ocdTicketId AS OrderId,
+      a.header.ocdContactMasterId AS ocdMasterId,
+      a.header.ticketDate AS OrderDate,
+      a.header.purchaseAmountTaxIncludedAfterDiscount as CHF--,
+      --SUM(itemQuantity) as UN
+    FROM
+      `emea-c1-dwh-prd.switzerland_all.sales_history` a--, UNNEST(lines) as hits 
+    WHERE
+      a.validPurchase-- and lineAmountTaxIncludedAfterDiscount	> 0
+    GROUP BY 1,2,3,4
+    UNION ALL
+    SELECT
+      b.context.ocdOrderId AS OrderId,
+      b.header.ocdContactMasterId AS ocdMasterId,
+      b.header.orderDate AS OrderDate,
+      b.header.orderTotalAmountTaxIncluded AS CHF--,
+      --SUM(itemQuantity) as UN 
+    FROM
+      `emea-c1-dwh-prd.switzerland_all.order` b--, UNNEST(lines) as hits
+    WHERE
+      b.validPurchase-- and lineAmountTaxIncludedAfterDiscount	> 0
+    GROUP BY 1,2,3,4 ) ),
+    
+spenderyear_tmp as (
+  SELECT
+  o.ocdmasterid,
+  o.orderid,
+  o.CHF,
+  o.orderdate, 
+  b.firstValidPurchaseDate,
+  case when date_diff(dateToday, o.orderdate, day) >= 1 and date_diff(dateToday, o.orderdate, day) <= 365 then true else false end as OrderLY,  
+  case when date_diff(dateToday, o.orderdate, day) > 365 and date_diff(dateToday, o.orderdate, day) <= 730 then true else false end as OrderLYm1,  
+  case when date_diff(dateToday, o.orderdate, day) > 730 and date_diff(dateToday, o.orderdate, day) <= 1095  then true else false end as OrderLYm2,  
+  
+  -- for total Active Spenders year 1,2,3 look at how many year of activity spender as if 
+  case when date_diff(dateToday, firstValidPurchaseDate, day)>= 1 and date_diff(dateToday, firstValidPurchaseDate, day) <= 365 
+        and date_diff(dateToday, o.orderdate, day) >= 1 and date_diff(dateToday, o.orderdate, day) <= 365 
+  then true else false end as TAS1,
+  case when date_diff(dateToday, firstValidPurchaseDate, day) > 365 and date_diff(dateToday, firstValidPurchaseDate, day) <= 730  
+        and date_diff(dateToday, o.orderdate, day) >= 1 and date_diff(dateToday, o.orderdate, day) <= 365 
+  then true else false end as TAS2,
+  case when date_diff(dateToday, firstValidPurchaseDate, day) > 730 and date_diff(dateToday, firstValidPurchaseDate, day) <= 1095 
+        and date_diff(dateToday, o.orderdate, day) >= 1 and date_diff(dateToday, o.orderdate, day) <= 365
+  then true else false end as TAS3,
+  
+  FROM `emea-c1-dwh-prd.switzerland_all.contact_master` b
+  LEFT JOIN orders_tmp o on o.ocdmasterid = b.contextmaster.ocdmasterid
+  order by 1),
+  
+clv_tmp as (
+  Select distinct ocdmasterid,
+  CASE WHEN SUM(case when OrderLY is true then 1 end)>0 then true end as LYSpender,
+  CASE WHEN SUM(case when OrderLYm1 is true then 1 end)>0 then true end as LYm1Spender,
+  CASE WHEN SUM(case when OrderLYm2 is true then 1 end)>0 then true end as LYm2Spender,
+  CASE WHEN SUM(case when OrderLY is true then 1 end)>0 and SUM(case when OrderLYm1 is true then 1 end)>0 then true end as RY2Spender,
+  CASE WHEN SUM(case when OrderLY is true then 1 end)>0 and SUM(case when OrderLYm2 is true then 1 end)>0 then true end as RY3Spender,
+  From spenderyear_tmp
+  group by 1
+  ),
+  
+sy_tmp as (
+  Select distinct s.ocdmasterid,
+  Count(distinct case when c.LYSpender and s.OrderLY then s.orderid end) as    Y1_AvgFrequency_Num,
+  SUM(case when c.LYSpender and s.OrderLY then CHF end) as Y1_AOV_Num,
+  Count(distinct case when c.RY2Spender and s.OrderLY then s.orderid end) as Y2_AvgFrequency_Num,
+  SUM(case when c.RY2Spender and s.OrderLY then CHF end) as Y2_AOV_Num,
+  Count(distinct case when c.RY2Spender then s.ocdmasterid end) as RY2Spender,
+  Count(distinct case when c.LYm1Spender then s.ocdmasterid end) as LYm1Spender,
+  Count(distinct case when  c.RY3Spender and s.OrderLY then s.orderid end) as Y3_AvgFrequency_Num,
+  SUM(case when c.RY3Spender and s.OrderLY then CHF end) as Y3_AOV_Num,
+  Count(distinct case when c.RY3Spender then s.ocdmasterid end) as RY3Spender,
+  Count(distinct case when c.LYm2Spender then s.ocdmasterid end) as LYm2Spender,
+  
+  Count(distinct case when c.LYSpender then s.ocdmasterid end) as TAS,
+  Count(distinct case when TAS1 then s.ocdmasterid end) as TAS1,
+  Count(distinct case when TAS2 then s.ocdmasterid end) as TAS2,
+  Count(distinct case when TAS3 then s.ocdmasterid end) as TAS3,
+  From spenderyear_tmp s
+  LEFT JOIN clv_tmp c on c.ocdmasterid = s.ocdmasterid
+  Group by 1)
+
+SELECT
+contextMaster.brand,
+COUNT(distinct m.contextMaster.ocdMasterId) as TotalCRMDatabase,
+COUNT(distinct CASE WHEN isContactable THEN m.contextMaster.ocdMasterId END) as Contactable,
+COUNT(distinct CASE WHEN engagedContact THEN m.contextMaster.ocdMasterId END) as KnownandEngaged,
+/* placed orders prior to 01/07/2020 */
+COUNT(distinct CASE WHEN nbValidPurchase>0 THEN m.contextMaster.ocdMasterId END) as TotalSpender,
+COUNT(distinct CASE WHEN DATE(firstValidPurchaseDate)<dateYearOne THEN m.contextMaster.ocdMasterId END) as TotalspendersExistedinYearOne,
+COUNT(distinct CASE WHEN DATE(firstValidPurchaseDate)<dateYearTwo THEN m.contextMaster.ocdMasterId END) as TotalspendersExistedinYearTwo,
+COUNT(distinct CASE WHEN DATE(firstValidPurchaseDate)<dateYearThree THEN m.contextMaster.ocdMasterId END) as TotalspendersExistedinYearThree,
+COUNT(distinct case when nbValidPurchase12M>0 then m.contextMaster.ocdMasterId end) as Buyers12M,
+
+SUM(sy.Y1_AvgFrequency_Num) as RollingY1_AvgFrequency_Num,
+SUM(sy.Y1_AOV_Num) as Y1_AOV_Num,
+SUM(sy.Y2_AvgFrequency_Num) as RollingY2_AvgFrequency_Num,
+SUM(sy.Y2_AOV_Num) as Y2_AOV_Num,
+SUM(sy.RY2Spender) as  RollingY2_Spenders,
+SUM(sy.LYm1Spender) as Spenders1to2YearsAgo,
+SUM(sy.Y3_AvgFrequency_Num) as RollingY3_AvgFrequency_Num,
+SUM(sy.Y3_AOV_Num) as Y3_AOV_Num,
+SUM(sy.RY3Spender) as RollingY3_Spenders,
+SUM(sy.LYm2Spender) as Spenders2to3YearsAgo,
+SUM(sy.TAS) as TotalActiveSpenders,
+SUM(sy.TAS1) as TotalActiveSpenders1stYear,
+SUM(sy.TAS2) as TotalActiveSpenders2ndYear,
+SUM(sy.TAS3) as TotalActiveSpenders3rdYear
+
+FROM `emea-c1-dwh-prd.switzerland_all.contact_master` m
+LEFT JOIN sy_tmp sy on sy.ocdmasterid = m.contextmaster.ocdmasterid
+-- exclude CC care contacts
+WHERE nominativeContact
+and not anonymizedContact
+and not cCareNonOptinContact
+and division <> "Consumer Products Division"
+and not regexp_contains(contextMaster.brand, "ValentinoEU|GiorgioArmaniEU|HelenaRubinsteinEU|UrbanDecay|LorealProfessionnel") 
+
+GROUP BY 1
